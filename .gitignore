@@ -3,3 +3,4 @@
 .sqlhistory
 *.log
 *.out
+.venv/
