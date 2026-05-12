@@ -135,17 +135,17 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             return False
 
     # ========== 3. 获取精确交易日列表 ==========
-    # 获取精确交易日列表（截至昨天，因为今天的数据可能还未完全生成）
-    yesterday_fmt = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+    # 查询到今天：Tushare 收盘后会更新当天数据
+    today_fmt = datetime.now().strftime('%Y%m%d')
     start_date_fmt = last_date.replace('-', '')
-    print(f"查询交易日历: {start_date_fmt} ~ {yesterday_fmt}")
+    print(f"查询交易日历: {start_date_fmt} ~ {today_fmt}")
 
-    trade_dates = get_trade_calendar(pro, start_date_fmt, yesterday_fmt)
+    trade_dates = get_trade_calendar(pro, start_date_fmt, today_fmt)
     if trade_dates is None:
         print("ERROR: 无法获取交易日历，尝试 fallback 模式...")
         trade_dates = []
         d = datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)
-        end = datetime.now() - timedelta(days=1)
+        end = datetime.now()
         while d <= end:
             ds = d.strftime('%Y%m%d')
             df = fetch_daily_with_retry(pro, ds)
@@ -400,9 +400,9 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
         v_cal = cal_path.read_text(encoding='utf-8').strip().split('\n')
         expected_len = len(v_cal) + BIN_OFFSET
         if len(v_adj) == expected_len:
-            print(f"  sh600000: bin 长度 {len(v_adj)} = calendar {len(v_cal)} + {BIN_OFFSET} ✓")
+            print(f"  sh600000: bin len {len(v_adj)} = calendar {len(v_cal)} + {BIN_OFFSET} OK")
         else:
-            print(f"  sh600000: bin 长度 {len(v_adj)} ≠ 预期 {expected_len} ✗")
+            print(f"  sh600000: bin len {len(v_adj)} != expected {expected_len} FAIL")
 
     print(f"\n=== 更新完成 ===")
     print(f"  新增交易日: {len(new_trade_dates)}")
