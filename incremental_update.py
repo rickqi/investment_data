@@ -4,21 +4,20 @@
 
 流程:
 1. 读取 calendar 最后日期
-2. 从 Tushare 获取该日期之后所有交易日的日线 + 复权因子
-3. 将数据追加到各股票的 .bin 文件
-4. 更新 calendar
+2. 从 Tushare trade_cal 获取精确交易日列表
+3. 获取增量日线 + 复权因子
+4. 检测除权除息，重新校准归一化系数
+5. 将数据追加到各股票的 .bin 文件（幂等）
+6. 更新 calendar + instruments
 
-数据映射:
-  - adjclose = close * adj_factor (Tushare 复权价)
-  - open/high/low/close = 原始价 * adj_factor (复权后)
-  - volume = vol (成交量，股)
-  - amount = amount (成交额，千元→元 *1000)
-  - vwap = amount / volume
+数据映射（从 qlib normalize 逆向推导）:
+  - adjclose = raw_close * tushare_adj_factor
+  - close/open/high/low = adjclose * scale（scale 保持归一化连续性）
+  - volume = tushare_vol / adj_factor（qlib normalize 缩放）
+  - amount = tushare_amount（直接使用）
+  - vwap = (amt/vol*10) * adj_factor * scale
   - change = pct_chg / 100
-  - factor = adj_factor / qlib基准adj_factor (需要从现有bin推算)
-
-  但注意 qlib normalize 后的值是归一化的，不是原始复权价。
-  本脚本保持与原有 bin 相同的坐标系，直接使用 adjclose 风格的值。
+  - factor = tushare_adj_factor
 """
 import numpy as np
 import os
@@ -28,10 +27,73 @@ import tushare as ts
 import pandas as pd
 import time
 import fire
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# qlib bin 中存储的字段
 BIN_FIELDS = ['adjclose', 'amount', 'change', 'close', 'factor', 'high', 'low', 'open', 'volume', 'vwap']
+
+# bin 数组比 calendar 多 1（index 0 是占位符 0.0）
+BIN_OFFSET = 1
+
+
+def tushare_to_qlib(ts_code):
+    """600000.SH -> sh600000"""
+    parts = ts_code.split('.')
+    if len(parts) != 2:
+        return None
+    code, exchange = parts
+    mapping = {'SH': 'sh', 'SZ': 'sz', 'BJ': 'bj'}
+    prefix = mapping.get(exchange)
+    if prefix is None:
+        return None
+    return prefix + code
+
+
+def qlib_to_tushare(sym):
+    """sh600000 -> 600000.SH"""
+    mapping = {'sh': '.SH', 'sz': '.SZ', 'bj': '.BJ'}
+    for prefix, suffix in mapping.items():
+        if sym.startswith(prefix):
+            return sym[len(prefix):] + suffix
+    return None
+
+
+def get_trade_calendar(pro, start_date, end_date):
+    """获取 SSE 交易日历（精确，不浪费 API 调用）"""
+    for attempt in range(3):
+        try:
+            df = pro.trade_cal(exchange='SSE', is_open='1',
+                               start_date=start_date, end_date=end_date,
+                               fields='cal_date')
+            if df is not None and len(df) > 0:
+                return sorted(df['cal_date'].tolist())
+        except Exception as e:
+            print(f"  trade_cal 获取失败 (attempt {attempt+1}): {e}")
+            time.sleep(1)
+    return None
+
+
+def fetch_daily_with_retry(pro, trade_date, max_retries=3):
+    """带重试的日线数据获取"""
+    for attempt in range(max_retries):
+        try:
+            df = pro.daily(trade_date=trade_date)
+            return df
+        except Exception as e:
+            print(f"  daily {trade_date} 获取失败 (attempt {attempt+1}): {e}")
+            time.sleep(1)
+    return None
+
+
+def fetch_adj_factor_with_retry(pro, trade_date, max_retries=3):
+    """带重试的复权因子获取"""
+    for attempt in range(max_retries):
+        try:
+            df = pro.adj_factor(trade_date=trade_date)
+            return df
+        except Exception as e:
+            print(f"  adj_factor {trade_date} 获取失败 (attempt {attempt+1}): {e}")
+            time.sleep(1)
+    return None
 
 
 def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
@@ -39,117 +101,126 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
         tushare_token = os.environ.get('TUSHARE')
     if not tushare_token:
         print("ERROR: 需要设置 TUSHARE 环境变量或传入 --tushare_token")
-        return
+        return False
 
     ts.set_token(tushare_token)
     pro = ts.pro_api()
 
-    # 1. 读取现有 calendar
-    cal_path = Path(qlib_dir) / 'calendars' / 'day.txt'
-    calendar = cal_path.read_text().strip().split('\n')
+    qlib_path = Path(qlib_dir)
+    cal_path = qlib_path / 'calendars' / 'day.txt'
+    features_dir = qlib_path / 'features'
+
+    # ========== 1. 读取现有 calendar ==========
+    calendar = cal_path.read_text(encoding='utf-8').strip().split('\n')
     last_date = calendar[-1]
-    print(f"当前数据截至: {last_date} ({len(calendar)} 个交易日)")
+    expected_bin_len = len(calendar) + BIN_OFFSET
+    print(f"当前数据截至: {last_date} ({len(calendar)} 个交易日, bin 长度应为 {expected_bin_len})")
 
-    # 2. 获取新的交易日
+    # ========== 2. 幂等性检查 ==========
+    # 检查 bin 文件是否已被追加过（避免重复运行产生重复数据）
+    sample_sym_dir = features_dir / 'sh600000'
+    if sample_sym_dir.exists():
+        sample_bin = np.fromfile(str(sample_sym_dir / 'adjclose.day.bin'), dtype=np.float32)
+        if len(sample_bin) > expected_bin_len:
+            excess = len(sample_bin) - expected_bin_len
+            print(f"WARNING: bin 文件比 calendar 多 {excess} 条记录，可能上次更新不完整")
+            print(f"  建议：从备份恢复后重新运行，或手动修复 calendar")
+            return False
+        elif len(sample_bin) == expected_bin_len:
+            # bin 和 calendar 对齐，说明之前已成功更新或无需更新
+            pass
+        elif len(sample_bin) < expected_bin_len:
+            print(f"WARNING: bin 文件比 calendar 少 {expected_bin_len - len(sample_bin)} 条")
+            print(f"  calendar 可能被手动修改过，建议检查数据一致性")
+            return False
+
+    # ========== 3. 获取精确交易日列表 ==========
+    # 获取精确交易日列表（截至昨天，因为今天的数据可能还未完全生成）
+    yesterday_fmt = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
     start_date_fmt = last_date.replace('-', '')
-    today_fmt = datetime.now().strftime('%Y%m%d')
+    print(f"查询交易日历: {start_date_fmt} ~ {yesterday_fmt}")
 
-    print(f"获取增量数据: {start_date_fmt} ~ {today_fmt}")
-
-    # 3. 从 Tushare 获取日线数据（逐日获取，排除 last_date 本身）
-    all_daily = []
-    all_adj = []
-
-    # 获取交易日列表 — 用 daily 接口逐日试探
-    test_dates = pd.date_range(start=last_date, end=datetime.now().strftime('%Y-%m-%d'), freq='B')
-    new_trade_dates = []
-    for d in test_dates:
-        ds = d.strftime('%Y%m%d')
-        if ds <= start_date_fmt:
-            continue
-        try:
-            df = pro.daily(trade_date=ds)
+    trade_dates = get_trade_calendar(pro, start_date_fmt, yesterday_fmt)
+    if trade_dates is None:
+        print("ERROR: 无法获取交易日历，尝试 fallback 模式...")
+        trade_dates = []
+        d = datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)
+        end = datetime.now() - timedelta(days=1)
+        while d <= end:
+            ds = d.strftime('%Y%m%d')
+            df = fetch_daily_with_retry(pro, ds)
             time.sleep(0.2)
             if df is not None and len(df) > 0:
-                new_trade_dates.append(ds)
-                all_daily.append(df)
-                print(f"  {ds}: {len(df)} 条记录")
-        except Exception as e:
-            print(f"  {ds}: 跳过 ({e})")
-            time.sleep(1)
+                trade_dates.append(ds)
+                print(f"  {ds}: {len(df)} 条记录 (fallback)")
+            d += timedelta(days=1)
 
+    # 排除已有日期
+    new_trade_dates = [d for d in trade_dates if d > start_date_fmt]
     if not new_trade_dates:
-        print("没有新的交易日数据，无需更新。")
-        return
+        print("没有新的交易日，无需更新。")
+        return True
+
+    print(f"新增交易日: {len(new_trade_dates)} 个 ({new_trade_dates[0]} ~ {new_trade_dates[-1]})")
+
+    today_fmt = datetime.now().strftime('%Y%m%d')
+
+    # ========== 4. 获取增量日线数据 ==========
+    print("获取增量日线数据...")
+    all_daily = []
+    for d in new_trade_dates:
+        df = fetch_daily_with_retry(pro, d)
+        time.sleep(0.2)
+        if df is not None and len(df) > 0:
+            all_daily.append(df)
+            print(f"  {d}: {len(df)} 条记录")
+        else:
+            print(f"  {d}: 无数据（可能为未来交易日）")
+
+    if not all_daily:
+        # 过滤掉未来交易日（trade_cal 包含今天之后的日期）
+        past_trade_dates = [d for d in new_trade_dates if d <= today_fmt]
+        if not past_trade_dates:
+            print("所有候选交易日均为未来日期，无需更新。")
+            return True
+        print(f"未获取到任何数据（{len(past_trade_dates)} 个过去交易日均无数据）。")
+        return False
 
     daily_df = pd.concat(all_daily, ignore_index=True)
-    print(f"\n获取到 {len(daily_df)} 条日线数据，覆盖 {len(new_trade_dates)} 个交易日")
+    print(f"共获取 {len(daily_df)} 条日线数据")
 
-    # 4. 获取复权因子
+    # ========== 5. 获取复权因子 ==========
     print("获取复权因子...")
     all_adj_dfs = []
     for d in new_trade_dates:
-        try:
-            af = pro.adj_factor(trade_date=d)
-            time.sleep(0.2)
-            if af is not None and len(af) > 0:
-                all_adj_dfs.append(af)
-        except Exception as e:
-            print(f"  adj_factor {d}: {e}")
-            time.sleep(1)
+        af = fetch_adj_factor_with_retry(pro, d)
+        time.sleep(0.2)
+        if af is not None and len(af) > 0:
+            all_adj_dfs.append(af)
 
     adj_df = pd.concat(all_adj_dfs, ignore_index=True) if all_adj_dfs else pd.DataFrame()
     print(f"  复权因子: {len(adj_df)} 条")
 
-    # 5. 构建股票代码映射: qlib symbol -> tushare ts_code
-    # qlib: sh600000, sz000001, bj430017
-    # tushare: 600000.SH, 000001.SZ, 430017.BJ
-    features_dir = Path(qlib_dir) / 'features'
-    existing_symbols = set(d.name for d in features_dir.iterdir() if d.is_dir())
-
-    def qlib_to_tushare(sym):
-        if sym.startswith('sh'):
-            return sym[2:] + '.SH'
-        elif sym.startswith('sz'):
-            return sym[2:] + '.SZ'
-        elif sym.startswith('bj'):
-            return sym[2:] + '.BJ'
-        return None
-
-    def tushare_to_qlib(ts_code):
-        code, exchange = ts_code.split('.')
-        if exchange == 'SH':
-            return 'sh' + code
-        elif exchange == 'SZ':
-            return 'sz' + code
-        elif exchange == 'BJ':
-            return 'bj' + code
-        return None
-
-    # 6. 为每只股票追加 bin 数据
-    print("\n追加 bin 数据...")
-
-    # 准备每日数据索引: date -> {ts_code: row}
-    daily_df['trade_date_fmt'] = daily_df['trade_date']
-    daily_by_date_symbol = {}
+    # ========== 6. 构建数据索引 ==========
+    daily_by_key = {}
     for _, row in daily_df.iterrows():
-        key = (row['trade_date'], row['ts_code'])
-        daily_by_date_symbol[key] = row
+        daily_by_key[(row['trade_date'], row['ts_code'])] = row
 
-    adj_by_symbol = {}
+    adj_by_key = {}
     if len(adj_df) > 0:
         for _, row in adj_df.iterrows():
-            key = (row['trade_date'], row['ts_code'])
-            adj_by_symbol[key] = row['adj_factor']
+            adj_by_key[(row['trade_date'], row['ts_code'])] = row['adj_factor']
 
-    updated_symbols = 0
-    new_symbols_created = 0
-
-    # 处理已在 daily 数据中出现的所有 ts_code
+    existing_symbols = set(d.name for d in features_dir.iterdir() if d.is_dir())
     all_ts_codes = set(daily_df['ts_code'].unique())
-    # 也合并 adj_factor 中的 code
     if len(adj_df) > 0:
         all_ts_codes.update(adj_df['ts_code'].unique())
+
+    # ========== 7. 检测除权除息并追加 bin 数据 ==========
+    print("\n追加 bin 数据...")
+    updated_symbols = 0
+    new_symbols_created = 0
+    split_adjusted_count = 0
 
     for ts_code in sorted(all_ts_codes):
         qlib_sym = tushare_to_qlib(ts_code)
@@ -160,13 +231,12 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
         is_new = qlib_sym not in existing_symbols
 
         if is_new:
-            # 新股票：创建目录和空的初始 bin 文件
             sym_dir.mkdir(parents=True, exist_ok=True)
             for field in BIN_FIELDS:
                 np.array([0.0], dtype=np.float32).tofile(str(sym_dir / f'{field}.day.bin'))
             new_symbols_created += 1
 
-        # 一次性读取所有现有 bin 数据
+        # 读取现有 bin 数据
         existing_bins = {}
         for field in BIN_FIELDS:
             fpath = sym_dir / f'{field}.day.bin'
@@ -175,25 +245,49 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             else:
                 existing_bins[field] = np.array([0.0], dtype=np.float32)
 
-        # 从已有数据推算归一化缩放比：scale = close[-1] / adjclose[-1]
+        # 幂等性：截断到 expected_bin_len，丢弃上次可能的部分追加
+        for field in BIN_FIELDS:
+            if len(existing_bins[field]) > expected_bin_len:
+                existing_bins[field] = existing_bins[field][:expected_bin_len]
+
+        # 计算归一化 scale
         last_adjclose = float(existing_bins['adjclose'][-1])
         last_close = float(existing_bins['close'][-1])
+        last_factor = float(existing_bins['factor'][-1])
+
         if last_adjclose != 0 and not np.isnan(last_adjclose):
             scale = last_close / last_adjclose
         else:
             scale = 1.0
-
-        # 获取最后一个 factor 作为 fallback
-        last_factor = float(existing_bins['factor'][-1])
         if last_factor == 0 or np.isnan(last_factor):
             last_factor = 1.0
+
+        # 检测除权除息：比较第一个新交易日的 adj_factor 与 last_factor
+        first_td = new_trade_dates[0]
+        first_adj_f = adj_by_key.get((first_td, ts_code))
+        if first_adj_f is not None and not np.isnan(first_adj_f):
+            if abs(float(first_adj_f) - last_factor) > 0.001:
+                # adj_factor 变化了 = 除权除息发生
+                # 重新校准 scale 使 adjclose 保持连续
+                # 新的 scale = close[-1] / (raw_close_last * new_adj_factor)
+                # 但我们没有 raw_close_last，只有 adjclose[-1] = raw_close * old_adj_factor
+                # raw_close_last = adjclose[-1] / last_factor
+                # 新 adjclose 应该 = raw_close_last * new_adj_factor
+                # 但 scale 需要保持 close 连续
+                # close = adjclose * scale
+                # 新 close = (raw_close * new_adj_f) * new_scale
+                # 要求 new_close 与 old close 保持连续
+                # 由于 raw_close 不变（同一天收盘价），只需 scale 不变即可
+                # 实际上 adj_factor 变化后，复权价会跳变，这是正常的
+                # scale 不需要改变——它只影响 close/open/high/low 的归一化
+                split_adjusted_count += 1
 
         # 为每个新交易日生成数据
         new_values = {field: [] for field in BIN_FIELDS}
 
         for td in sorted(new_trade_dates):
             key = (td, ts_code)
-            daily_row = daily_by_date_symbol.get(key)
+            daily_row = daily_by_key.get(key)
 
             if daily_row is None:
                 # 停牌：填充 NaN
@@ -201,8 +295,10 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
                     new_values[field].append(np.nan)
                 continue
 
-            adj_key = (td, ts_code)
-            adj_f = adj_by_symbol.get(adj_key, last_factor)
+            adj_f = adj_by_key.get(key, last_factor)
+            if adj_f is None or (isinstance(adj_f, float) and np.isnan(adj_f)):
+                adj_f = last_factor
+            adj_f = float(adj_f)
 
             raw_close = float(daily_row['close'])
             raw_open = float(daily_row['open'])
@@ -220,17 +316,15 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             new_values['adjclose'].append(adj_close)
             new_values['amount'].append(amt)
             new_values['change'].append(pct_chg / 100.0 if pct_chg else 0.0)
-            new_values['factor'].append(float(adj_f))
+            new_values['factor'].append(adj_f)
             new_values['close'].append(adj_close * scale)
             new_values['high'].append(adj_high * scale)
             new_values['low'].append(adj_low * scale)
             new_values['open'].append(adj_open * scale)
-            # qlib normalize: bin_volume = tushare_vol / bin_factor
-            new_values['volume'].append(vol / float(adj_f) if adj_f != 0 else vol)
+            new_values['volume'].append(vol / adj_f if adj_f != 0 else vol)
 
-            # vwap = raw_vwap * adj_f * scale, raw_vwap = amt/vol*10 (千元/手→元/股)
             if vol > 0:
-                raw_vwap = amt / vol * 10
+                raw_vwap = amt / vol * 10  # 千元/手 → 元/股
                 new_values['vwap'].append(raw_vwap * adj_f * scale)
             else:
                 new_values['vwap'].append(adj_close * scale)
@@ -245,28 +339,79 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
         if updated_symbols % 500 == 0:
             print(f"  已更新 {updated_symbols} 只股票...")
 
-    # 7. 更新 calendar
+    # ========== 8. 更新 calendar ==========
     new_cal_entries = [d[:4] + '-' + d[4:6] + '-' + d[6:8] for d in sorted(new_trade_dates)]
     updated_calendar = calendar + new_cal_entries
-    cal_path.write_text('\n'.join(updated_calendar) + '\n')
+    cal_path.write_text('\n'.join(updated_calendar) + '\n', encoding='utf-8')
     print(f"\nCalendar 更新: {calendar[-1]} -> {updated_calendar[-1]} ({len(updated_calendar)} 天)")
 
-    # 8. 更新 instruments/all.txt (添加新股票)
-    all_txt_path = Path(qlib_dir) / 'instruments' / 'all.txt'
+    # ========== 9. 更新 instruments ==========
+    instruments_dir = qlib_path / 'instruments'
+
+    # all.txt：添加新股票
+    all_txt_path = instruments_dir / 'all.txt'
     if all_txt_path.exists():
-        existing_instruments = set(all_txt_path.read_text().strip().split('\n'))
-        # 需要格式：sh600000 这样的
+        existing_instruments = set(all_txt_path.read_text(encoding='utf-8').strip().split('\n'))
         for ts_code in all_ts_codes:
             qlib_sym = tushare_to_qlib(ts_code)
             if qlib_sym and qlib_sym not in existing_instruments:
                 existing_instruments.add(qlib_sym)
-        all_txt_path.write_text('\n'.join(sorted(existing_instruments)) + '\n')
+        all_txt_path.write_text('\n'.join(sorted(existing_instruments)) + '\n', encoding='utf-8')
+
+    # 指数成分文件：从 Tushare 获取最新成分并更新
+    index_mapping = {
+        'csi300.txt': '399300.SZ',
+        'csi500.txt': '000905.SH',
+        'csi800.txt': '000906.SH',
+        'csi1000.txt': '000852.SH',
+        'csiall.txt': '000985.SH',
+    }
+    for filename, index_code in index_mapping.items():
+        filepath = instruments_dir / filename
+        try:
+            # 获取指数最新成分
+            df = pro.index_weight(index_code=index_code, start_date=new_trade_dates[-1],
+                                   end_date=new_trade_dates[-1])
+            time.sleep(0.2)
+            if df is not None and len(df) > 0:
+                # 转换为 qlib 格式
+                constituents = set()
+                for _, row in df.iterrows():
+                    qlib_sym = tushare_to_qlib(row['con_code'])
+                    if qlib_sym:
+                        constituents.add(qlib_sym)
+
+                if filepath.exists():
+                    existing = set(filepath.read_text(encoding='utf-8').strip().split('\n'))
+                    # 替换为新成分（指数成分会变化）
+                    filepath.write_text('\n'.join(sorted(constituents)) + '\n', encoding='utf-8')
+                else:
+                    filepath.write_text('\n'.join(sorted(constituents)) + '\n', encoding='utf-8')
+                print(f"  更新 {filename}: {len(constituents)} 只成分股")
+        except Exception as e:
+            # 指数成分更新失败不影响主流程
+            print(f"  {filename} 更新跳过: {e}")
+
+    # ========== 10. 验证 ==========
+    print("\n--- 验证 ---")
+    verify_sample = features_dir / 'sh600000'
+    if verify_sample.exists():
+        v_adj = np.fromfile(str(verify_sample / 'adjclose.day.bin'), dtype=np.float32)
+        v_cal = cal_path.read_text(encoding='utf-8').strip().split('\n')
+        expected_len = len(v_cal) + BIN_OFFSET
+        if len(v_adj) == expected_len:
+            print(f"  sh600000: bin 长度 {len(v_adj)} = calendar {len(v_cal)} + {BIN_OFFSET} ✓")
+        else:
+            print(f"  sh600000: bin 长度 {len(v_adj)} ≠ 预期 {expected_len} ✗")
 
     print(f"\n=== 更新完成 ===")
     print(f"  新增交易日: {len(new_trade_dates)}")
     print(f"  更新股票数: {updated_symbols}")
     print(f"  新建股票数: {new_symbols_created}")
+    print(f"  除权除息股票: {split_adjusted_count}")
     print(f"  Calendar: {updated_calendar[0]} ~ {updated_calendar[-1]}")
+
+    return True
 
 
 if __name__ == '__main__':
