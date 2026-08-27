@@ -155,35 +155,32 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
                 print(f"  {ds}: {len(df)} 条记录 (fallback)")
             d += timedelta(days=1)
 
-    # 排除已有日期
-    new_trade_dates = [d for d in trade_dates if d > start_date_fmt]
+    # 排除已有日期；且只保留严格早于今天的日期（01:00 运行时"今天"尚无数据，
+    # 若把今天写入日历会以 NaN 占位且永不补拉 —— 数据污染根因，2026-08-27 修复）
+    new_trade_dates = [d for d in trade_dates if start_date_fmt < d < today_fmt]
     if not new_trade_dates:
         print("没有新的交易日，无需更新。")
         return True
 
     print(f"新增交易日: {len(new_trade_dates)} 个 ({new_trade_dates[0]} ~ {new_trade_dates[-1]})")
 
-    today_fmt = datetime.now().strftime('%Y%m%d')
-
     # ========== 4. 获取增量日线数据 ==========
     print("获取增量日线数据...")
     all_daily = []
+    fetched_dates = []  # 实际获取到数据的日期（仅这些日期写入 bin 并加入日历）
     for d in new_trade_dates:
         df = fetch_daily_with_retry(pro, d)
         time.sleep(0.2)
         if df is not None and len(df) > 0:
             all_daily.append(df)
+            fetched_dates.append(d)
             print(f"  {d}: {len(df)} 条记录")
         else:
             print(f"  {d}: 无数据（可能为未来交易日）")
 
     if not all_daily:
-        # 过滤掉未来交易日（trade_cal 包含今天之后的日期）
-        past_trade_dates = [d for d in new_trade_dates if d <= today_fmt]
-        if not past_trade_dates:
-            print("所有候选交易日均为未来日期，无需更新。")
-            return True
-        print(f"未获取到任何数据（{len(past_trade_dates)} 个过去交易日均无数据）。")
+        # new_trade_dates 已过滤为过去日期，此处仅报告失败（日历保持不变，下轮重试）
+        print(f"未获取到任何数据（{len(new_trade_dates)} 个过去交易日均无数据）。")
         return False
 
     daily_df = pd.concat(all_daily, ignore_index=True)
@@ -192,7 +189,7 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
     # ========== 5. 获取复权因子 ==========
     print("获取复权因子...")
     all_adj_dfs = []
-    for d in new_trade_dates:
+    for d in fetched_dates:
         af = fetch_adj_factor_with_retry(pro, d)
         time.sleep(0.2)
         if af is not None and len(af) > 0:
@@ -263,7 +260,7 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             last_factor = 1.0
 
         # 检测除权除息：比较第一个新交易日的 adj_factor 与 last_factor
-        first_td = new_trade_dates[0]
+        first_td = fetched_dates[0]
         first_adj_f = adj_by_key.get((first_td, ts_code))
         if first_adj_f is not None and not np.isnan(first_adj_f):
             if abs(float(first_adj_f) - last_factor) > 0.001:
@@ -285,7 +282,7 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
         # 为每个新交易日生成数据
         new_values = {field: [] for field in BIN_FIELDS}
 
-        for td in sorted(new_trade_dates):
+        for td in sorted(fetched_dates):
             key = (td, ts_code)
             daily_row = daily_by_key.get(key)
 
@@ -340,7 +337,7 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             print(f"  已更新 {updated_symbols} 只股票...")
 
     # ========== 8. 更新 calendar ==========
-    new_cal_entries = [d[:4] + '-' + d[4:6] + '-' + d[6:8] for d in sorted(new_trade_dates)]
+    new_cal_entries = [d[:4] + '-' + d[4:6] + '-' + d[6:8] for d in sorted(fetched_dates)]
     updated_calendar = calendar + new_cal_entries
     cal_path.write_text('\n'.join(updated_calendar) + '\n', encoding='utf-8')
     print(f"\nCalendar 更新: {calendar[-1]} -> {updated_calendar[-1]} ({len(updated_calendar)} 天)")
@@ -370,8 +367,8 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
         filepath = instruments_dir / filename
         try:
             # 获取指数最新成分
-            df = pro.index_weight(index_code=index_code, start_date=new_trade_dates[-1],
-                                   end_date=new_trade_dates[-1])
+            df = pro.index_weight(index_code=index_code, start_date=fetched_dates[-1],
+                                   end_date=fetched_dates[-1])
             time.sleep(0.2)
             if df is not None and len(df) > 0:
                 # 转换为 qlib 格式
@@ -405,7 +402,7 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             print(f"  sh600000: bin len {len(v_adj)} != expected {expected_len} FAIL")
 
     print(f"\n=== 更新完成 ===")
-    print(f"  新增交易日: {len(new_trade_dates)}")
+    print(f"  新增交易日: {len(fetched_dates)}")
     print(f"  更新股票数: {updated_symbols}")
     print(f"  新建股票数: {new_symbols_created}")
     print(f"  除权除息股票: {split_adjusted_count}")
