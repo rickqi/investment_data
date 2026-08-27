@@ -383,17 +383,23 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
     # ========== 9. 更新 instruments ==========
     instruments_dir = qlib_path / 'instruments'
 
-    # all.txt：添加新股票
+    # all.txt：添加新股票（t8 协调: 新成员以 3 列 "<sym> <首交易日> 2099-12-31" 追加，
+    # 取代旧裸代码追加——统一格式且保证长期有效不截断）
     all_txt_path = instruments_dir / 'all.txt'
     if all_txt_path.exists():
-        existing_instruments = set(all_txt_path.read_text(encoding='utf-8').strip().split('\n'))
+        lines = all_txt_path.read_text(encoding='utf-8').strip().split('\n')
+        known = {ln.split()[0] for ln in lines if ln.split()}
+        additions = []
         for ts_code in all_ts_codes:
             qlib_sym = tushare_to_qlib(ts_code)
-            if qlib_sym and qlib_sym not in existing_instruments:
-                existing_instruments.add(qlib_sym)
-        all_txt_path.write_text('\n'.join(sorted(existing_instruments)) + '\n', encoding='utf-8')
+            if qlib_sym and qlib_sym.upper() not in known and qlib_sym.lower() not in known:
+                start_d = fetched_dates[0][:4] + '-' + fetched_dates[0][4:6] + '-' + fetched_dates[0][6:8]
+                additions.append(f"{qlib_sym.upper()}\t{start_d}\t2099-12-31")
+        if additions:
+            all_txt_path.write_text('\n'.join(sorted(lines + additions)) + '\n', encoding='utf-8')
 
-    # 指数成分文件：从 Tushare 获取最新成分并更新
+    # 指数成分文件：从 Tushare 获取最新成分并更新（t8 协调: 合并写入 3 列格式，
+    # 保留历史区间——原实现整文件替换为裸代码会丢失历史并造成格式不一致）
     index_mapping = {
         'csi300.txt': '399300.SZ',
         'csi500.txt': '000905.SH',
@@ -409,20 +415,40 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
                                    end_date=fetched_dates[-1])
             time.sleep(0.2)
             if df is not None and len(df) > 0:
-                # 转换为 qlib 格式
+                # 转换为 qlib 格式（大写 SH/SZ/BJ 前缀，与指数文件约定一致）
                 constituents = set()
                 for _, row in df.iterrows():
                     qlib_sym = tushare_to_qlib(row['con_code'])
                     if qlib_sym:
-                        constituents.add(qlib_sym)
+                        constituents.add(qlib_sym.upper())
 
                 if filepath.exists():
-                    existing = set(filepath.read_text(encoding='utf-8').strip().split('\n'))
-                    # 替换为新成分（指数成分会变化）
-                    filepath.write_text('\n'.join(sorted(constituents)) + '\n', encoding='utf-8')
+                    # 合并: 保留历史行；当前成分 end→2099-12-31；新成分追加 "<sym> <快照日> 2099-12-31"
+                    rows = []
+                    for ln in filepath.read_text(encoding='utf-8').strip().split('\n'):
+                        p = ln.split()
+                        if len(p) == 3:
+                            rows.append([p[0], p[1], p[2]])
+                        elif len(p) == 1:
+                            rows.append([p[0], '2000-01-01', '2099-12-31'])
+                    max_end = max(r[2] for r in rows) if rows else ''
+                    max_set = {r[0] for r in rows if r[2] == max_end}
+                    cur = {}
+                    for r in rows:
+                        cur.setdefault(r[0], []).append(r)
+                    snap_d = fetched_dates[-1][:4] + '-' + fetched_dates[-1][4:6] + '-' + fetched_dates[-1][6:8]
+                    for sym in sorted(constituents):
+                        if sym in max_set:
+                            last = max(cur[sym], key=lambda x: x[1])
+                            if last[2] != '2099-12-31':
+                                last[2] = '2099-12-31'
+                        else:
+                            rows.append([sym, snap_d, '2099-12-31'])
+                    rows.sort(key=lambda r: (r[0], r[1]))
+                    filepath.write_text('\n'.join('\t'.join(r) for r in rows) + '\n', encoding='utf-8')
                 else:
                     filepath.write_text('\n'.join(sorted(constituents)) + '\n', encoding='utf-8')
-                print(f"  更新 {filename}: {len(constituents)} 只成分股")
+                print(f"  更新 {filename}: {len(constituents)} 只成分股（t8 合并写入 3 列格式）")
         except Exception as e:
             # 指数成分更新失败不影响主流程
             print(f"  {filename} 更新跳过: {e}")
