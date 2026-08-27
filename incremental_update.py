@@ -57,6 +57,41 @@ def qlib_to_tushare(sym):
     return None
 
 
+def _compute_scale(existing_bins):
+    """从已有 bin 计算归一化 scale（close/adjclose）—— R6 加固（2026-08-28）。
+
+    原实现只取最后一个条目（incremental_update 旧 L250-258）：
+      - bin 末尾为 NaN 洞（停牌占位 / 拉取失败，2026-05-15 事故根因）时，
+        last_adjclose=NaN → scale 回退 1.0，close=adjclose×1.0 归一化断裂；
+      - last_close=NaN（adjclose 有效）时甚至产生 NaN scale，污染后续全部新数据。
+    现回溯至最近一个有效 (close, adjclose) 对；仅全 0 占位（新股票）保持 1.0。
+
+    返回 (scale, 跳过的无效条目数, 跳过区是否含 NaN)——调用方据此告警。
+    正常路径（末尾条目有效）行为与旧实现逐位一致。
+    repair-round-2（reviewer t10 边界缺陷）: 全 NaN / 全无效 bin 的 fallback 不再静默——
+    has_nan 以整数组 NaN 存在性判定（原返回 False 使调用方告警条件不触发，
+    静默回退 1.0 与 05-15 事故同形），全 NaN 时告警并保持 scale=1.0（不 fail，避免
+    停牌股阻断流水线；但会显式告警供人工核查）。
+    """
+    close_arr = existing_bins['close']
+    adj_arr = existing_bins['adjclose']
+    for i in range(len(close_arr) - 1, -1, -1):
+        adj_c = float(adj_arr[i])
+        clo_c = float(close_arr[i])
+        if adj_c != 0 and not np.isnan(adj_c) and not np.isnan(clo_c):
+            tail_c = close_arr[i + 1:]
+            tail_a = adj_arr[i + 1:]
+            tail_has_nan = bool(
+                (np.isnan(tail_c).any() if len(tail_c) else False)
+                or (np.isnan(tail_a).any() if len(tail_a) else False)
+            )
+            return clo_c / adj_c, len(tail_c), tail_has_nan
+        # 无效条目（NaN 或 0 占位）继续回溯
+    # 全数组无有效对（全 NaN / 全 0 / 混合无效）: scale 回退 1.0，has_nan 判 NaN 存在性
+    has_nan = bool(np.isnan(close_arr).any() or np.isnan(adj_arr).any())
+    return 1.0, len(close_arr), has_nan
+
+
 def get_trade_calendar(pro, start_date, end_date):
     """获取 SSE 交易日历（精确，不浪费 API 调用）"""
     for attempt in range(3):
@@ -247,15 +282,18 @@ def incremental_update(qlib_dir=r'C:\codes\qlib\qlib_bin', tushare_token=None):
             if len(existing_bins[field]) > expected_bin_len:
                 existing_bins[field] = existing_bins[field][:expected_bin_len]
 
-        # 计算归一化 scale
-        last_adjclose = float(existing_bins['adjclose'][-1])
-        last_close = float(existing_bins['close'][-1])
+        # 计算归一化 scale（R6 加固: 回溯最近有效 (close, adjclose) 对，
+        # 防 NaN 洞导致 scale 回退 1.0 归一化断裂 / NaN 传播——2026-05 事故根因）
+        scale, scale_skipped, tail_has_nan = _compute_scale(existing_bins)
+        if scale_skipped and tail_has_nan:
+            if scale_skipped >= len(existing_bins["close"]):
+                # 全数组无有效 (close, adjclose) 对（全 NaN/全无效）——05-15 事故同形，显式告警
+                print(f"  [WARN][R6] {qlib_sym}: bin 全部 {scale_skipped} 条为 NaN/无效条目，"
+                      f"scale 回退 1.0（与 05-15 事故同形，需人工核查）")
+            else:
+                print(f"  [WARN][R6] {qlib_sym}: bin 末尾跳过 {scale_skipped} 条 NaN/无效条目，"
+                      f"scale 回溯自最近有效对 = {scale}")
         last_factor = float(existing_bins['factor'][-1])
-
-        if last_adjclose != 0 and not np.isnan(last_adjclose):
-            scale = last_close / last_adjclose
-        else:
-            scale = 1.0
         if last_factor == 0 or np.isnan(last_factor):
             last_factor = 1.0
 
